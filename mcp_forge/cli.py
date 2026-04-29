@@ -3,6 +3,11 @@
 Defines the ``generate`` command and all its options.  All heavy lifting is
 delegated to :mod:`mcp_forge.loader`, :mod:`mcp_forge.parser`, and
 :mod:`mcp_forge.generator` so this module stays thin and testable.
+
+Typical usage::
+
+    mcp-forge generate path/to/openapi.yaml --language python --output ./my_server
+    mcp-forge generate https://api.example.com/openapi.json --language node
 """
 
 from __future__ import annotations
@@ -35,86 +40,202 @@ def main() -> None:
 @click.option(
     "--output",
     "-o",
-    "output_dir",
-    type=click.Path(file_okay=False, dir_okay=True, writable=True, path_type=Path),
-    default=Path("mcp_server_output"),
+    default="./mcp_server",
     show_default=True,
-    help="Directory where the generated project will be written.",
-)
-@click.option(
-    "--auth/--no-auth",
-    default=True,
-    show_default=True,
-    help="Whether to scaffold authentication boilerplate.",
+    help="Output directory for the generated project files.",
+    type=click.Path(file_okay=False, dir_okay=True, writable=True, path_type=str),
 )
 @click.option(
     "--server-name",
-    default=None,
-    help="Override the MCP server name (defaults to the OpenAPI title).",
+    "-n",
+    default="",
+    help=(
+        "Human-readable name for the MCP server. "
+        "Defaults to the API title from the spec."
+    ),
+)
+@click.option(
+    "--include-auth/--no-auth",
+    default=True,
+    show_default=True,
+    help=(
+        "Include authentication boilerplate based on the spec's "
+        "securitySchemes (Bearer token / API key)."
+    ),
+)
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help="Print detailed progress information.",
 )
 def generate(
     spec: str,
     language: str,
-    output_dir: Path,
-    auth: bool,
-    server_name: Optional[str],
+    output: str,
+    server_name: str,
+    include_auth: bool,
+    verbose: bool,
 ) -> None:
-    """Generate an MCP server from an OpenAPI 3.x SPEC.
+    """Generate a fully functional MCP server from an OpenAPI 3.x spec.
 
-    SPEC can be a local file path (YAML or JSON) or a remote HTTPS URL.
+    SPEC can be a local file path or a remote URL (http:// or https://).
 
-    Examples::
+    Examples:
 
-        mcp-forge generate ./openapi.yaml
-        mcp-forge generate https://example.com/api/openapi.yaml --language node
-        mcp-forge generate ./petstore.yaml -o ./my_server --no-auth
+    \b
+        mcp-forge generate openapi.yaml
+        mcp-forge generate openapi.yaml --language node --output ./my_node_server
+        mcp-forge generate https://api.example.com/openapi.json --language python
+        mcp-forge generate openapi.yaml --no-auth --server-name "My Pet API"
     """
-    # Imports are deferred to here so that the CLI can be imported without
-    # triggering heavy initialisation at import time.
-    from mcp_forge.loader import load_spec
-    from mcp_forge.parser import parse_spec
-    from mcp_forge.generator import generate as run_generate
+    # Defer imports so startup is fast for --help and --version invocations.
+    from mcp_forge.generator import GeneratorError, generate as _generate
+    from mcp_forge.loader import LoaderError, load_spec
+    from mcp_forge.parser import ParserError, parse_spec
 
-    click.echo(f"mcp-forge {__version__}")
-    click.echo(f"Loading spec from: {spec}")
+    output_dir = Path(output)
 
+    # ------------------------------------------------------------------
+    # Step 1: Load the OpenAPI spec.
+    # ------------------------------------------------------------------
+    _info(f"Loading spec from: {spec}", verbose)
     try:
         spec_dict = load_spec(spec)
-    except Exception as exc:  # noqa: BLE001
-        click.secho(f"Error loading spec: {exc}", fg="red", err=True)
+    except LoaderError as exc:
+        _error(f"Failed to load spec: {exc}")
         sys.exit(1)
 
-    click.echo("Parsing endpoints…")
-    try:
-        tool_definitions = parse_spec(spec_dict)
-    except Exception as exc:  # noqa: BLE001
-        click.secho(f"Error parsing spec: {exc}", fg="red", err=True)
-        sys.exit(1)
-
-    click.echo(f"Found {len(tool_definitions)} tool(s).")
-
-    effective_server_name: str = (
-        server_name
-        or spec_dict.get("info", {}).get("title", "mcp_server")
+    api_title: str = spec_dict.get("info", {}).get("title") or "MCP Server"
+    api_version: str = spec_dict.get("info", {}).get("version") or "unknown"
+    _info(
+        f"Loaded spec: {api_title!r} (version {api_version})",
+        verbose,
     )
 
-    click.echo(f"Generating {language} server '{effective_server_name}' → {output_dir}")
+    # ------------------------------------------------------------------
+    # Step 2: Parse operations into ToolDefinitions.
+    # ------------------------------------------------------------------
+    _info("Parsing operations…", verbose)
     try:
-        run_generate(
-            tool_definitions=tool_definitions,
-            spec=spec_dict,
-            language=language.lower(),
-            output_dir=output_dir,
-            server_name=effective_server_name,
-            include_auth=auth,
-        )
-    except Exception as exc:  # noqa: BLE001
-        click.secho(f"Error generating output: {exc}", fg="red", err=True)
+        tool_definitions = parse_spec(spec_dict)
+    except ParserError as exc:
+        _error(f"Failed to parse spec: {exc}")
         sys.exit(1)
 
-    click.secho("✓ Done!", fg="green")
-    click.echo(f"  Output written to: {output_dir.resolve()}")
+    num_tools = len(tool_definitions)
+    if num_tools == 0:
+        click.echo(
+            click.style(
+                "Warning: No operations found in the spec. "
+                "The generated server will have no tools.",
+                fg="yellow",
+            ),
+            err=True,
+        )
+    else:
+        _info(f"Found {num_tools} operation(s) to scaffold.", verbose)
+
+    if verbose:
+        for tool in tool_definitions:
+            click.echo(
+                f"  • {tool.http_method:6s} {tool.path}  →  {tool.name}()"
+            )
+
+    # ------------------------------------------------------------------
+    # Step 3: Generate output files.
+    # ------------------------------------------------------------------
+    resolved_name = server_name.strip() or api_title
+    _info(
+        f"Generating {language} MCP server '{resolved_name}' → {output_dir}",
+        verbose,
+    )
+    try:
+        written_files = _generate(
+            tool_definitions=tool_definitions,
+            spec=spec_dict,
+            language=language,
+            output_dir=output_dir,
+            server_name=resolved_name,
+            include_auth=include_auth,
+        )
+    except GeneratorError as exc:
+        _error(f"Generation failed: {exc}")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Step 4: Report success.
+    # ------------------------------------------------------------------
+    click.echo(
+        click.style("✓ MCP server scaffolded successfully!", fg="green", bold=True)
+    )
+    click.echo(f"  Output directory : {output_dir.resolve()}")
+    click.echo(f"  Language         : {language}")
+    click.echo(f"  Tools generated  : {num_tools}")
+    click.echo(f"  Auth boilerplate : {'yes' if include_auth else 'no'}")
+    click.echo()
+    click.echo("Files written:")
+    for path in written_files:
+        click.echo(f"  {path}")
+    click.echo()
+    _print_next_steps(language, output_dir)
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _info(message: str, verbose: bool) -> None:
+    """Print *message* to stdout only when *verbose* is ``True``.
+
+    Parameters
+    ----------
+    message:
+        Message text to display.
+    verbose:
+        When ``False`` the message is suppressed.
+    """
+    if verbose:
+        click.echo(message)
+
+
+def _error(message: str) -> None:
+    """Print a styled error *message* to stderr.
+
+    Parameters
+    ----------
+    message:
+        Error message text to display.
+    """
+    click.echo(
+        click.style(f"Error: {message}", fg="red", bold=True),
+        err=True,
+    )
+
+
+def _print_next_steps(language: str, output_dir: Path) -> None:
+    """Print language-specific next-step instructions to the user.
+
+    Parameters
+    ----------
+    language:
+        The target language (``"python"`` or ``"node"``).
+    output_dir:
+        The directory where files were written.
+    """
+    click.echo(click.style("Next steps:", bold=True))
+    rel = output_dir
+
+    if language == "python":
+        click.echo(f"  cd {rel}")
+        click.echo("  python -m venv .venv && source .venv/bin/activate")
+        click.echo("  pip install -r requirements.txt")
+        click.echo("  export BEARER_TOKEN=<your-token>  # if required")
+        click.echo("  python server.py")
+    else:  # node
+        click.echo(f"  cd {rel}")
+        click.echo("  npm install")
+        click.echo("  export BEARER_TOKEN=<your-token>  # if required")
+        click.echo("  npm start")
