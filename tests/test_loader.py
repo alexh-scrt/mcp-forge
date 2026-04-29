@@ -148,8 +148,6 @@ class TestLoadSpecUrl:
 
     def test_http_error_raises_loader_error(self) -> None:
         """A 404 response must raise LoaderError."""
-        import httpx
-
         mock_resp = self._mock_response("", status_code=404)
         with patch("mcp_forge.loader.httpx.get", return_value=mock_resp):
             with pytest.raises(LoaderError, match="HTTP 404"):
