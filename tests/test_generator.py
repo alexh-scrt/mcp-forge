@@ -1,11 +1,12 @@
-"""Tests for mcp_forge.generator.
+"""Integration and unit tests for mcp_forge.generator.
 
 Covers template rendering, file writing, language selection, auth boilerplate,
-and error handling in the generator module.
+full pipeline integration against the petstore fixture, and all error paths.
 """
 
 from __future__ import annotations
 
+import json as _json
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +15,13 @@ import yaml
 
 from mcp_forge.generator import (
     GeneratorError,
+    _build_jinja_env,
     _collect_security_schemes,
     _extract_base_url,
     _get_template_plan,
     _render_template,
     _write_file,
     generate,
-    _build_jinja_env,
 )
 from mcp_forge.models import (
     ParameterLocation,
@@ -42,7 +43,7 @@ PETSTORE_YAML = FIXTURE_DIR / "petstore.yaml"
 
 
 def _load_petstore() -> dict[str, Any]:
-    """Load the petstore YAML fixture."""
+    """Load the petstore YAML fixture as a dict."""
     return yaml.safe_load(PETSTORE_YAML.read_text(encoding="utf-8"))
 
 
@@ -70,7 +71,7 @@ def _minimal_tool(
 
 
 def _bearer_scheme() -> SecurityScheme:
-    """Return a bearer auth security scheme."""
+    """Return a bearer auth SecurityScheme."""
     return SecurityScheme(
         name="bearerAuth",
         scheme_type=SecuritySchemeType.HTTP,
@@ -81,18 +82,18 @@ def _bearer_scheme() -> SecurityScheme:
 
 
 def _api_key_scheme() -> SecurityScheme:
-    """Return an API key security scheme."""
+    """Return an API key SecurityScheme."""
     return SecurityScheme(
         name="apiKey",
         scheme_type=SecuritySchemeType.API_KEY,
         api_key_in="header",
         api_key_name="X-API-Key",
-        description="API key",
+        description="API key in header",
     )
 
 
 def _minimal_spec(**extra: Any) -> dict[str, Any]:
-    """Return a minimal OpenAPI spec dict."""
+    """Return a minimal valid OpenAPI spec dict."""
     spec: dict[str, Any] = {
         "openapi": "3.0.3",
         "info": {"title": "Test API", "version": "1.0.0"},
@@ -111,6 +112,7 @@ class TestGeneratePython:
     """Integration tests for the Python code generator."""
 
     def test_creates_output_directory(self, tmp_path: Path) -> None:
+        """generate() must create the output directory when it does not exist."""
         out = tmp_path / "new_server"
         assert not out.exists()
         generate(
@@ -122,6 +124,7 @@ class TestGeneratePython:
         assert out.is_dir()
 
     def test_writes_three_files(self, tmp_path: Path) -> None:
+        """generate() must write exactly three files for Python."""
         out = tmp_path / "server"
         written = generate(
             tool_definitions=[_minimal_tool()],
@@ -321,6 +324,134 @@ class TestGeneratePython:
         assert isinstance(result, list)
         assert all(isinstance(p, Path) for p in result)
 
+    def test_returned_paths_are_absolute(self, tmp_path: Path) -> None:
+        out = tmp_path / "server"
+        result = generate(
+            tool_definitions=[_minimal_tool()],
+            spec=_minimal_spec(),
+            language="python",
+            output_dir=out,
+        )
+        for p in result:
+            assert p.is_absolute()
+
+    def test_api_key_auth_included_when_include_auth_true(self, tmp_path: Path) -> None:
+        tool = _minimal_tool()
+        tool.security_schemes.append(_api_key_scheme())
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[tool],
+            spec=_minimal_spec(),
+            language="python",
+            output_dir=out,
+            include_auth=True,
+        )
+        content = (out / "server.py").read_text(encoding="utf-8")
+        assert "API_KEY" in content
+
+    def test_tools_py_contains_httpx_import(self, tmp_path: Path) -> None:
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[_minimal_tool()],
+            spec=_minimal_spec(),
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "tools.py").read_text(encoding="utf-8")
+        assert "httpx" in content
+
+    def test_idempotent_generation(self, tmp_path: Path) -> None:
+        """Running generate() twice must produce identical files."""
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[_minimal_tool(name="list_items")],
+            spec=_minimal_spec(),
+            language="python",
+            output_dir=out,
+        )
+        content_first = (out / "tools.py").read_text(encoding="utf-8")
+        generate(
+            tool_definitions=[_minimal_tool(name="list_items")],
+            spec=_minimal_spec(),
+            language="python",
+            output_dir=out,
+        )
+        content_second = (out / "tools.py").read_text(encoding="utf-8")
+        assert content_first == content_second
+
+    def test_tool_with_path_parameter_substitution_in_tools_py(self, tmp_path: Path) -> None:
+        """Path parameter substitution code must appear in tools.py."""
+        tool = _minimal_tool(name="get_item", path="/items/{itemId}")
+        tool.parameters.append(
+            ToolParameter(
+                name="itemId",
+                location=ParameterLocation.PATH,
+                description="Item ID",
+                required=True,
+                schema={"type": "integer"},
+            )
+        )
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[tool],
+            spec=_minimal_spec(),
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "tools.py").read_text(encoding="utf-8")
+        assert "itemId" in content
+
+    def test_tool_with_query_params_in_tools_py(self, tmp_path: Path) -> None:
+        """Query parameter building code must appear in tools.py."""
+        tool = _minimal_tool(name="search_items", path="/items")
+        tool.parameters.append(
+            ToolParameter(
+                name="query",
+                location=ParameterLocation.QUERY,
+                description="Search query",
+                required=False,
+                schema={"type": "string"},
+            )
+        )
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[tool],
+            spec=_minimal_spec(),
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "tools.py").read_text(encoding="utf-8")
+        assert "query" in content
+        assert "params" in content
+
+    def test_post_tool_with_request_body_in_tools_py(self, tmp_path: Path) -> None:
+        """Request body building code must appear in tools.py for POST tools."""
+        tool = _minimal_tool(name="create_item", method="POST", path="/items")
+        tool.request_body = RequestBody(
+            description="Item data",
+            required=True,
+            content_type="application/json",
+            schema={"type": "object"},
+            fields=[
+                RequestBodyField(
+                    name="title",
+                    description="Item title",
+                    required=True,
+                    schema={"type": "string"},
+                )
+            ],
+        )
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[tool],
+            spec=_minimal_spec(),
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "tools.py").read_text(encoding="utf-8")
+        assert "title" in content
+        assert "body" in content
+
 
 # ---------------------------------------------------------------------------
 # generate() – Node.js target
@@ -444,6 +575,84 @@ class TestGenerateNode:
         # Template lowercases and hyphenates the server name.
         assert "pet-store" in content
 
+    def test_package_json_is_valid_json(self, tmp_path: Path) -> None:
+        """package.json must be parseable as valid JSON."""
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[_minimal_tool()],
+            spec=_minimal_spec(),
+            language="node",
+            output_dir=out,
+        )
+        raw = (out / "package.json").read_text(encoding="utf-8")
+        parsed = _json.loads(raw)
+        assert isinstance(parsed, dict)
+
+    def test_tools_js_contains_tool_definitions(self, tmp_path: Path) -> None:
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[_minimal_tool(name="find_pet")],
+            spec=_minimal_spec(),
+            language="node",
+            output_dir=out,
+        )
+        content = (out / "tools.js").read_text(encoding="utf-8")
+        assert "TOOL_DEFINITIONS" in content
+        assert "find_pet" in content
+
+    def test_tools_js_exports_tool_functions(self, tmp_path: Path) -> None:
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[_minimal_tool(name="list_orders")],
+            spec=_minimal_spec(),
+            language="node",
+            output_dir=out,
+        )
+        content = (out / "tools.js").read_text(encoding="utf-8")
+        assert "module.exports" in content
+        assert "list_orders" in content
+
+    def test_server_js_imports_sdk(self, tmp_path: Path) -> None:
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[_minimal_tool()],
+            spec=_minimal_spec(),
+            language="node",
+            output_dir=out,
+        )
+        content = (out / "server.js").read_text(encoding="utf-8")
+        assert "@modelcontextprotocol/sdk" in content
+
+    def test_api_key_auth_in_server_js(self, tmp_path: Path) -> None:
+        tool = _minimal_tool()
+        tool.security_schemes.append(_api_key_scheme())
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=[tool],
+            spec=_minimal_spec(),
+            language="node",
+            output_dir=out,
+            include_auth=True,
+        )
+        content = (out / "server.js").read_text(encoding="utf-8")
+        assert "API_KEY" in content
+
+    def test_multiple_tools_in_tools_js(self, tmp_path: Path) -> None:
+        tools = [
+            _minimal_tool(name="list_pets", path="/pets"),
+            _minimal_tool(name="get_pet", path="/pets/{id}"),
+        ]
+        out = tmp_path / "server"
+        generate(
+            tool_definitions=tools,
+            spec=_minimal_spec(),
+            language="node",
+            output_dir=out,
+        )
+        content = (out / "tools.js").read_text(encoding="utf-8")
+        assert "list_pets" in content
+        assert "get_pet" in content
+
 
 # ---------------------------------------------------------------------------
 # generate() – error cases
@@ -462,12 +671,19 @@ class TestGenerateErrors:
                 output_dir=tmp_path / "out",
             )
 
+    def test_unsupported_language_go_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(GeneratorError):
+            generate(
+                tool_definitions=[],
+                spec=_minimal_spec(),
+                language="go",
+                output_dir=tmp_path / "out",
+            )
+
     def test_unwritable_output_dir_raises(self, tmp_path: Path) -> None:
-        """Writing to a path where a file already exists as the dir name should fail."""
-        # Create a file where the output dir should be.
+        """Writing to a path where a file already blocks directory creation."""
         blocker = tmp_path / "blocker"
         blocker.write_text("I am a file", encoding="utf-8")
-        # Now try to use it as a directory.
         with pytest.raises((GeneratorError, OSError)):
             generate(
                 tool_definitions=[],
@@ -476,18 +692,30 @@ class TestGenerateErrors:
                 output_dir=blocker / "subdir",
             )
 
+    def test_generator_error_is_exception(self) -> None:
+        """GeneratorError must be a subclass of Exception."""
+        assert issubclass(GeneratorError, Exception)
+
 
 # ---------------------------------------------------------------------------
-# Petstore integration test
+# Petstore integration tests
 # ---------------------------------------------------------------------------
 
 
 class TestGeneratePetstore:
-    """Full pipeline integration: petstore fixture → generator → file assertions."""
+    """Full pipeline: petstore fixture → parse_spec → generate → assert output."""
 
     def setup_method(self) -> None:
         self.spec = _load_petstore()
         self.tools = parse_spec(self.spec)
+
+    def test_correct_number_of_tools_parsed(self) -> None:
+        """Petstore must yield exactly 5 operations."""
+        assert len(self.tools) == 5
+
+    # ------------------------------------------------------------------
+    # Python target
+    # ------------------------------------------------------------------
 
     def test_generates_python_server_from_petstore(self, tmp_path: Path) -> None:
         out = tmp_path / "petstore_server"
@@ -524,7 +752,7 @@ class TestGeneratePetstore:
         )
         content = (out / "server.py").read_text(encoding="utf-8")
         for tool in self.tools:
-            assert tool.name in content, f"Missing tool: {tool.name}"
+            assert tool.name in content, f"Missing tool in server.py: {tool.name}"
 
     def test_python_server_contains_base_url(self, tmp_path: Path) -> None:
         out = tmp_path / "petstore_py"
@@ -548,6 +776,116 @@ class TestGeneratePetstore:
         )
         content = (out / "server.py").read_text(encoding="utf-8")
         assert "BEARER_TOKEN" in content
+
+    def test_python_server_no_bearer_when_no_auth(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_py_noauth"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+            include_auth=False,
+        )
+        content = (out / "server.py").read_text(encoding="utf-8")
+        assert "BEARER_TOKEN" not in content
+
+    def test_python_tools_contains_input_schema(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_py"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "tools.py").read_text(encoding="utf-8")
+        assert "inputSchema" in content
+
+    def test_python_tools_contains_path_parameter_substitution(self, tmp_path: Path) -> None:
+        """petId is a path parameter – substitution code must appear."""
+        out = tmp_path / "petstore_py"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "tools.py").read_text(encoding="utf-8")
+        assert "petId" in content
+
+    def test_python_tools_contains_query_parameter_code(self, tmp_path: Path) -> None:
+        """listPets has limit and status query params."""
+        out = tmp_path / "petstore_py"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "tools.py").read_text(encoding="utf-8")
+        assert "limit" in content
+        assert "status" in content
+
+    def test_python_tools_contains_post_handler(self, tmp_path: Path) -> None:
+        """createPet must generate a POST handler with body code."""
+        out = tmp_path / "petstore_py"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "tools.py").read_text(encoding="utf-8")
+        # createPet uses POST and has a request body
+        assert "async def createpet" in content
+        assert "body" in content
+
+    def test_python_server_contains_list_tools_handler(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_py"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "server.py").read_text(encoding="utf-8")
+        assert "list_tools" in content or "ListToolsResult" in content or "handle_list_tools" in content
+
+    def test_python_server_contains_call_tool_handler(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_py"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "server.py").read_text(encoding="utf-8")
+        assert "call_tool" in content or "CallToolResult" in content or "handle_call_tool" in content
+
+    def test_python_requirements_contains_httpx(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_py"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "requirements.txt").read_text(encoding="utf-8")
+        assert "httpx" in content
+
+    def test_python_server_name_is_petstore(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_py"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="python",
+            output_dir=out,
+        )
+        content = (out / "server.py").read_text(encoding="utf-8")
+        assert "Petstore" in content
+
+    # ------------------------------------------------------------------
+    # Node.js target
+    # ------------------------------------------------------------------
 
     def test_generates_node_server_from_petstore(self, tmp_path: Path) -> None:
         out = tmp_path / "petstore_node"
@@ -574,9 +912,19 @@ class TestGeneratePetstore:
         for tool in self.tools:
             assert tool.name in content, f"Missing tool: {tool.name}"
 
-    def test_node_package_json_is_valid_structure(self, tmp_path: Path) -> None:
-        import json as _json
+    def test_node_server_contains_all_tool_names(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_node"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="node",
+            output_dir=out,
+        )
+        content = (out / "server.js").read_text(encoding="utf-8")
+        for tool in self.tools:
+            assert tool.name in content, f"Missing tool in server.js: {tool.name}"
 
+    def test_node_package_json_is_valid_structure(self, tmp_path: Path) -> None:
         out = tmp_path / "petstore_node"
         generate(
             tool_definitions=self.tools,
@@ -590,28 +938,89 @@ class TestGeneratePetstore:
         assert "dependencies" in pkg
         assert "@modelcontextprotocol/sdk" in pkg["dependencies"]
 
-    def test_tools_py_contains_input_schema(self, tmp_path: Path) -> None:
-        out = tmp_path / "petstore_py"
+    def test_node_package_json_has_main_field(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_node"
         generate(
             tool_definitions=self.tools,
             spec=self.spec,
-            language="python",
+            language="node",
             output_dir=out,
         )
-        content = (out / "tools.py").read_text(encoding="utf-8")
+        raw = (out / "package.json").read_text(encoding="utf-8")
+        pkg = _json.loads(raw)
+        assert pkg.get("main") == "server.js"
+
+    def test_node_tools_contains_input_schema(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_node"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="node",
+            output_dir=out,
+        )
+        content = (out / "tools.js").read_text(encoding="utf-8")
         assert "inputSchema" in content
 
-    def test_tools_py_contains_path_parameter_substitution(self, tmp_path: Path) -> None:
-        out = tmp_path / "petstore_py"
+    def test_node_tools_exports_all_functions(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_node"
         generate(
             tool_definitions=self.tools,
             spec=self.spec,
-            language="python",
+            language="node",
             output_dir=out,
         )
-        content = (out / "tools.py").read_text(encoding="utf-8")
-        # petId is a path parameter – its substitution code should appear
-        assert "petId" in content
+        content = (out / "tools.js").read_text(encoding="utf-8")
+        assert "module.exports" in content
+        for tool in self.tools:
+            assert tool.name in content
+
+    def test_node_server_bearer_token_when_auth(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_node"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="node",
+            output_dir=out,
+            include_auth=True,
+        )
+        content = (out / "server.js").read_text(encoding="utf-8")
+        assert "BEARER_TOKEN" in content
+
+    def test_node_server_no_bearer_when_no_auth(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_node_noauth"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="node",
+            output_dir=out,
+            include_auth=False,
+        )
+        content = (out / "server.js").read_text(encoding="utf-8")
+        assert "BEARER_TOKEN" not in content
+
+    def test_node_server_contains_base_url(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_node"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="node",
+            output_dir=out,
+        )
+        content = (out / "server.js").read_text(encoding="utf-8")
+        assert "petstore.example.com" in content
+
+    def test_node_package_json_has_scripts(self, tmp_path: Path) -> None:
+        out = tmp_path / "petstore_node"
+        generate(
+            tool_definitions=self.tools,
+            spec=self.spec,
+            language="node",
+            output_dir=out,
+        )
+        raw = (out / "package.json").read_text(encoding="utf-8")
+        pkg = _json.loads(raw)
+        assert "scripts" in pkg
+        assert "start" in pkg["scripts"]
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +1057,18 @@ class TestGetTemplatePlan:
         with pytest.raises(GeneratorError):
             _get_template_plan("go")
 
+    def test_python_template_paths_are_strings(self) -> None:
+        plan = _get_template_plan("python")
+        for tpl, out in plan:
+            assert isinstance(tpl, str)
+            assert isinstance(out, str)
+
+    def test_node_template_paths_are_strings(self) -> None:
+        plan = _get_template_plan("node")
+        for tpl, out in plan:
+            assert isinstance(tpl, str)
+            assert isinstance(out, str)
+
 
 # ---------------------------------------------------------------------------
 # _extract_base_url
@@ -655,7 +1076,7 @@ class TestGetTemplatePlan:
 
 
 class TestExtractBaseUrl:
-    """Tests for _extract_base_url in generator module."""
+    """Tests for _extract_base_url in the generator module."""
 
     def test_extracts_from_servers(self) -> None:
         spec = _minimal_spec(servers=[{"url": "https://api.example.com/v2"}])
@@ -673,6 +1094,15 @@ class TestExtractBaseUrl:
             ]
         )
         assert _extract_base_url(spec) == "https://prod.example.com"
+
+    def test_returns_empty_for_empty_servers_list(self) -> None:
+        spec = _minimal_spec(servers=[])
+        assert _extract_base_url(spec) == ""
+
+    def test_returns_empty_when_servers_is_none(self) -> None:
+        spec = _minimal_spec()
+        spec["servers"] = None
+        assert _extract_base_url(spec) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +1151,14 @@ class TestCollectSecuritySchemes:
         assert result[0].name == "bearerAuth"
         assert result[1].name == "apiKey"
 
+    def test_tool_with_no_schemes_skipped(self) -> None:
+        tool1 = _minimal_tool(name="t1")  # no schemes
+        tool2 = _minimal_tool(name="t2")
+        tool2.security_schemes.append(_bearer_scheme())
+        result = _collect_security_schemes([tool1, tool2])
+        assert len(result) == 1
+        assert result[0].name == "bearerAuth"
+
 
 # ---------------------------------------------------------------------------
 # _write_file
@@ -745,6 +1183,17 @@ class TestWriteFile:
         dest.write_text("old content", encoding="utf-8")
         _write_file(dest, "new content")
         assert dest.read_text(encoding="utf-8") == "new content"
+
+    def test_writes_utf8_content(self, tmp_path: Path) -> None:
+        dest = tmp_path / "unicode.txt"
+        content = "Hello, 世界! Ñoño."
+        _write_file(dest, content)
+        assert dest.read_text(encoding="utf-8") == content
+
+    def test_writes_empty_string(self, tmp_path: Path) -> None:
+        dest = tmp_path / "empty.txt"
+        _write_file(dest, "")
+        assert dest.read_text(encoding="utf-8") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +1234,21 @@ class TestRenderTemplate:
         assert "list_items" in result
         assert "TOOL_DEFINITIONS" in result
 
+    def test_renders_python_requirements_template(self) -> None:
+        env = _build_jinja_env()
+        context = {
+            "tools": [],
+            "server_name": "My Server",
+            "base_url": "",
+            "language": "python",
+            "include_auth": False,
+            "security_schemes": [],
+            "spec": _minimal_spec(),
+        }
+        result = _render_template(env, "python/requirements.txt.j2", context)
+        assert "mcp" in result
+        assert "httpx" in result
+
     def test_renders_node_server_template(self) -> None:
         env = _build_jinja_env()
         context = {
@@ -800,7 +1264,52 @@ class TestRenderTemplate:
         assert "Node Server" in result
         assert "get_thing" in result
 
+    def test_renders_node_tools_template(self) -> None:
+        env = _build_jinja_env()
+        context = {
+            "tools": [_minimal_tool(name="fetch_data")],
+            "server_name": "Node Server",
+            "base_url": "",
+            "language": "node",
+            "include_auth": False,
+            "security_schemes": [],
+            "spec": _minimal_spec(),
+        }
+        result = _render_template(env, "node/tools.js.j2", context)
+        assert "fetch_data" in result
+        assert "TOOL_DEFINITIONS" in result
+        assert "module.exports" in result
+
+    def test_renders_node_package_json_template(self) -> None:
+        env = _build_jinja_env()
+        context = {
+            "tools": [],
+            "server_name": "My API",
+            "base_url": "",
+            "language": "node",
+            "include_auth": False,
+            "security_schemes": [],
+            "spec": _minimal_spec(),
+        }
+        result = _render_template(env, "node/package.json.j2", context)
+        parsed = _json.loads(result)
+        assert "@modelcontextprotocol/sdk" in parsed["dependencies"]
+
     def test_missing_template_raises_generator_error(self) -> None:
         env = _build_jinja_env()
         with pytest.raises(GeneratorError, match="Template not found"):
             _render_template(env, "nonexistent/template.j2", {})
+
+    def test_render_returns_non_empty_string(self) -> None:
+        env = _build_jinja_env()
+        context = {
+            "tools": [],
+            "server_name": "S",
+            "base_url": "",
+            "language": "python",
+            "include_auth": False,
+            "security_schemes": [],
+            "spec": _minimal_spec(),
+        }
+        result = _render_template(env, "python/requirements.txt.j2", context)
+        assert len(result) > 0
