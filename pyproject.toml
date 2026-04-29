@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "mcp_forge"
+version = "0.1.0"
+description = "Scaffold a fully functional MCP server from any OpenAPI 3.x specification."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "mcp_forge contributors" }
+]
+keywords = ["mcp", "openapi", "scaffold", "cli", "model-context-protocol"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Code Generators",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "click>=8.1",
+  "pyyaml>=6.0",
+  "jinja2>=3.1",
+  "httpx>=0.27",
+  "jsonschema>=4.21",
+]
+
+[project.scripts]
+mcp-forge = "mcp_forge.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/example/mcp_forge"
+Issues = "https://github.com/example/mcp_forge/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_forge*"]
+
+[tool.setuptools.package-data]
+mcp_forge = ["templates/**/*.j2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
